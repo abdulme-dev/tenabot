@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # === Your API keys directly (no .env for Pydroid)
-TELEGRAM_BOT_TOKEN = 7789827415:AAGZsCFQI2e8BFfxs2MCPLSa5EcUFh17phY
+TELEGRAM_BOT_TOKEN = "7789827415:AAGZsCFQI2e8BFfxs2MCPLSa5EcUFh17phY"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 MODEL = os.getenv("MODEL", "mistralai/mistral-7b-instruct")
