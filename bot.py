@@ -141,6 +141,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Welcome to TenaBot!\nSend me a message or an image.")
 
 # === Main App Setup ===
+
+print("telebotkkjch: ", TELEGRAM_BOT_TOKEN)
 app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
