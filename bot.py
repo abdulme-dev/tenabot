@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 
 # === User Tracking and Rate Limiting ===
 user_set = set()
-ADMIN_IDS = {7448164827}  # Replace with your Telegram ID
+ADMIN_IDS = os.getenv("ADMIN_ID")  # Replace with your Telegram ID
 RATE_LIMIT = 5  # messages
 TIME_WINDOW = 10 * 10  # 1 hour
 user_requests = defaultdict(list)
