@@ -47,7 +47,7 @@ def get_ai_reply(prompt):
                 ]
             }
         )
-        return GoogleTranslator(source="auto", target="am").translate(res.json()["choices"][0]["message"]["content"])
+        return res.json()["choices"][0]["message"]["content"]
     except Exception as e:
         logging.error(f"Chat error: {e}")
         return "⚠️ Couldn't generate a reply."
