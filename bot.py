@@ -75,6 +75,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_set.add(user.id)
     logging.info(f"/start by {user.id} - @{user.username}")
+
+    # Save user info to file
+    user_info = f"{user.id},{user.username or 'NoUsername'},{user.first_name or ''},{user.last_name or ''}\n"
+    try:
+        # Avoid duplicate entries
+        if not os.path.exists("users.txt") or str(user.id) not in open("users.txt", encoding="utf-8").read():
+            with open("users.txt", "a", encoding="utf-8") as f:
+                f.write(user_info)
+    except Exception as e:
+        logging.error(f"Error saving user: {e}")
+
     await update.message.reply_text("💬 Send me a message and I'll reply!")
 
 # === /users ===
