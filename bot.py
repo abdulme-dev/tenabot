@@ -2,17 +2,18 @@ import os
 import logging
 import asyncio
 import tempfile
+import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler, CommandHandler
 from PIL import Image
-import pytesseract
 import requests
+import pytesseract
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 # ===== LOGGING =====
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +38,9 @@ def register_user(user_id):
         save_users()
         logging.info(f"✅ New user registered: {user_id}")
 
+# ===== TRANSLATION CACHE =====
+translation_cache = {}
+
 # ===== SUBJECT BUTTONS =====
 def subject_keyboard():
     return InlineKeyboardMarkup([
@@ -55,6 +59,30 @@ def task_keyboard():
         [InlineKeyboardButton("📄 Assignment", callback_data="task|assignment")],
     ])
 
+# ===== OPENROUTER API CALL =====
+def openrouter_api_call(prompt):
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "model": "deepseek/deepseek-r1:free",
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        try:
+            resp_json = response.json()
+            # Extract AI text output
+            return resp_json["choices"][0]["message"]["content"]
+        except Exception as e:
+            logging.error(f"JSON parse error: {e}")
+            return "⚠️ Failed to parse AI response."
+    else:
+        logging.error(f"OpenRouter API Error {response.status_code}: {response.text}")
+        return "⚠️ Failed to generate content."
+
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
@@ -72,25 +100,6 @@ async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📋 Registered Users:\n" + "\n".join(registered_users))
     else:
         await update.message.reply_text("📋 No registered users found.")
-
-# ===== OPENROUTER API CALL =====
-def openrouter_api_call(prompt, subject=None, image_path=None):
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "model": "deepseek/deepseek-r1:free",
-        "messages": [{"role": "user", "content": prompt}],
-        "image": image_path,
-    }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        logging.error(f"OpenRouter API Error: {response.status_code} - {response.text}")
-        return None
 
 # ===== SUBJECT HANDLER =====
 async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,13 +121,16 @@ async def handle_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = f"Create a {task_type} for {subject} with multiple questions and answers."
     await query.message.chat.send_action(action=ChatAction.TYPING)
+    reply_text = await asyncio.to_thread(openrouter_api_call, prompt)
+    sent_msg = await query.message.reply_text(reply_text)
 
-    response = openrouter_api_call(prompt, subject)
-    if response:
-        reply = response.get("choices", [{}])[0].get("message", {}).get("content", "No response")
-        await query.message.reply_text(reply)
-    else:
-        await query.message.reply_text("⚠️ Failed to generate content.")
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_text, "en": reply_text, "current": "am"}
+
+    keyboard = [
+        [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")],
+        [InlineKeyboardButton("🔄 Change Subject", callback_data="change_subject")]
+    ]
+    await query.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== TEXT MESSAGE HANDLER =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -130,13 +142,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = f"[{subject}] {update.message.text}"
     await update.message.chat.send_action(action=ChatAction.TYPING)
+    reply_text = await asyncio.to_thread(openrouter_api_call, prompt)
+    sent_msg = await update.message.reply_text(reply_text)
 
-    response = openrouter_api_call(prompt, subject)
-    if response:
-        reply = response.get("choices", [{}])[0].get("message", {}).get("content", "No response")
-        await update.message.reply_text(reply)
-    else:
-        await update.message.reply_text("⚠️ Failed to generate content.")
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_text, "en": reply_text, "current": "am"}
+
+    keyboard = [
+        [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")],
+        [InlineKeyboardButton("🔄 Change Subject", callback_data="change_subject")]
+    ]
+    await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== PHOTO HANDLER =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -158,19 +173,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Couldn't read any text from the image. Please type your question.")
                 return
 
-            prompt = f"[{subject}] Extracted question:\n{text}"
-            await update.message.chat.send_action(action=ChatAction.TYPING)
+            # Encode image to Base64
+            with open(tmp.name, "rb") as f:
+                img_base64 = base64.b64encode(f.read()).decode("utf-8")
+            prompt = f"[image: {img_base64}] [{subject}] Extracted question:\n{text}"
 
-            response = openrouter_api_call(prompt, subject, image_path=tmp.name)
-            if response:
-                reply = response.get("choices", [{}])[0].get("message", {}).get("content", "No response")
-                await update.message.reply_text(reply)
-            else:
-                await update.message.reply_text("⚠️ Failed to generate content.")
-            os.remove(tmp.name)
+            reply_text = await asyncio.to_thread(openrouter_api_call, prompt)
+
+        sent_msg = await update.message.reply_text(reply_text)
+        translation_cache[str(sent_msg.message_id)] = {"am": reply_text, "en": reply_text, "current": "am"}
+
+        keyboard = [
+            [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")],
+            [InlineKeyboardButton("🔄 Change Subject", callback_data="change_subject")]
+        ]
+        await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+        os.remove(tmp.name)
 
     except Exception as e:
-        logging.error("Photo handler error: %s", e)
+        logging.error(f"Photo handler error: {e}")
         await update.message.reply_text("⚠️ Image processing failed.")
 
 # ===== BUTTON HANDLER =====
@@ -184,13 +205,27 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         action, data = query.data.split("|", 1)
 
-        if action == "subject":
+        if action == "translate":
+            msg_id = data
+            data = translation_cache.get(msg_id)
+            if not data:
+                await query.message.reply_text("⚠️ Message not found.")
+                return
+
+            if data["current"] == "am":
+                await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
+                data["current"] = "en"
+            else:
+                await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
+                data["current"] = "am"
+
+        elif action == "subject":
             await handle_subject(update, context)
         elif action == "task":
             await handle_task(update, context)
 
     except Exception as e:
-        logging.error("Button Error: %s", e)
+        logging.error(f"Button Error: {e}")
         await query.message.reply_text("⚠️ Button failed.")
 
 # ===== SETUP BOT =====
