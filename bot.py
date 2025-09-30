@@ -7,11 +7,11 @@ from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler, CommandHandler
 from PIL import Image
 import pytesseract
-import img2pdf
 import requests
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 # ===== LOGGING =====
@@ -36,6 +36,27 @@ def register_user(user_id):
         registered_users.add(user_id)
         save_users()
         logging.info(f"✅ New user registered: {user_id}")
+
+# ===== AI HELPER =====
+def get_ai_reply(prompt, subject=None):
+    """Call Hugging Face free inference API"""
+    model = "google/flan-t5-small"
+    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+    payload = {"inputs": prompt}
+    response = requests.post(f"https://api-inference.huggingface.co/models/{model}", headers=headers, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        if isinstance(result, list) and "generated_text" in result[0]:
+            reply = result[0]["generated_text"]
+        elif isinstance(result, dict) and "generated_text" in result:
+            reply = result["generated_text"]
+        else:
+            reply = "⚠️ AI failed to respond."
+    else:
+        reply = f"⚠️ API Error {response.status_code}"
+    return reply, reply  # Same text for AM & EN for simplicity
+
+translation_cache = {}
 
 # ===== TELEGRAM HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,6 +119,20 @@ async def handle_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
     await query.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ===== TEXT MESSAGE =====
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    prompt = update.message.text
+    await update.message.chat.send_action(action=ChatAction.TYPING)
+
+    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt)
+    sent_msg = await update.message.reply_text(reply_am)
+
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+
+    keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
+    await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
+
 # ===== IMAGE MESSAGE (OCR) =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
@@ -114,8 +149,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             prompt = f"Extracted question from image:\n{text}"
-            subject = context.user_data.get("subject", None)
-            reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
+            reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt)
 
         sent_msg = await update.message.reply_text(reply_am)
         translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
@@ -144,13 +178,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if data["current"] == "am":
                 await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
                 data["current"] = "en"
-                keyboard = [[InlineKeyboardButton("🌐 Translate to Amharic", callback_data=f"translate|{msg_id}")]]
-                await query.message.reply_text("🌍 አማርኛ ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
             else:
                 await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
                 data["current"] = "am"
-                keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{msg_id}")]]
-                await query.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
         elif action == "subject":
             await handle_subject(update, context)
@@ -169,7 +199,7 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(CallbackQueryHandler(handle_button))
 
-print("🚀 TenaBot is live...")
+print("🚀 Bot is live...")
 
 if __name__ == "__main__":
     asyncio.run(app.run_polling())
