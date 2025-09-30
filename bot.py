@@ -15,25 +15,21 @@ from telegram.ext import (
 )
 from deep_translator import GoogleTranslator
 
-# === Load keys from environment variables ===
+# === Load API Keys from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))  # default 0 if not set
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))  # Replace with your Telegram ID
 
-# HuggingFace free models
-HF_TEXT_MODEL = os.getenv("HF_TEXT_MODEL", "google/flan-t5-small")
-HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "Salesforce/blip-image-captioning-base")
-
-# === Logging & cache ===
+# === Logging
 logging.basicConfig(level=logging.INFO)
-translation_cache = {}
-registered_users = set()
-USER_DB_FILE = "users.txt"
 
-# === Load registered users ===
+# === Users DB
+USER_DB_FILE = "users.txt"
 if os.path.exists(USER_DB_FILE):
     with open(USER_DB_FILE, "r") as f:
         registered_users = set(line.strip() for line in f if line.strip())
+else:
+    registered_users = set()
 
 def save_users():
     with open(USER_DB_FILE, "w") as f:
@@ -45,102 +41,115 @@ def register_user(user_id):
     if user_id not in registered_users:
         registered_users.add(user_id)
         save_users()
-        print(f"✅ New user registered: {user_id}")
+        logging.info(f"✅ New user registered: {user_id}")
 
-# === HuggingFace text generation ===
-def hf_text_generate(prompt):
+# === Translation cache
+translation_cache = {}
+
+# === Subjects
+SUBJECTS = ["Math", "Physics", "Chemistry", "Biology", "English"]
+
+# === OpenRouter AI function
+def get_ai_reply(prompt, subject=None):
     try:
-        url = f"https://api-inference.huggingface.co/models/{HF_TEXT_MODEL}"
-        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-        data = {"inputs": prompt}
-        res = requests.post(url, headers=headers, json=data, timeout=60)
-        output = res.json()
-        if isinstance(output, list) and "generated_text" in output[0]:
-            return output[0]["generated_text"]
-        return "⚠️ Couldn't generate a reply."
+        system_msg = f"You are a helpful assistant for {subject or 'general'} topics."
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ]
+            },
+            timeout=30
+        )
+        data = res.json()
+        content = data["choices"][0]["message"]["content"]
+        # Translate to Amharic
+        reply_am = GoogleTranslator(source="auto", target="am").translate(content)
+        return content, reply_am
     except Exception as e:
-        print("HF Text Error:", e)
-        return "⚠️ Error generating text."
+        logging.error("AI Error: %s", e)
+        return "⚠️ Couldn't generate a reply.", "⚠️ መልስ ማፍጠር አልተሳካም።"
 
-# === HuggingFace image captioning ===
-def hf_image_caption(image_path):
-    try:
-        url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
-        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-        with open(image_path, "rb") as f:
-            res = requests.post(url, headers=headers, files={"inputs": f}, timeout=60)
-        output = res.json()
-        if isinstance(output, dict) and "error" in output:
-            return "⚠️ Couldn't process the image."
-        return output[0].get("generated_text", "❌ Couldn't describe the image.")
-    except Exception as e:
-        print("HF Image Error:", e)
-        return "⚠️ Image processing failed."
+# === Command: /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton(sub, callback_data=f"subject|{sub}") for sub in SUBJECTS]
+    ]
+    await update.message.reply_text(
+        "👋 Welcome! Choose your subject to start:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-# === Translate functions ===
-def translate_to_amharic(text):
-    return GoogleTranslator(source="auto", target="am").translate(text=text)
+# === Command: /allusers (Admin only)
+async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+    if registered_users:
+        await update.message.reply_text("📋 Registered Users:\n" + "\n".join(registered_users))
+    else:
+        await update.message.reply_text("📋 No registered users found.")
 
-def translate_to_english(text):
-    return GoogleTranslator(source="auto", target="en").translate(text=text)
+# === Handle subject selection
+async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, subject = query.data.split("|", 1)
+    context.user_data["subject"] = subject
+    await query.message.reply_text(f"✅ Subject set to *{subject}*.\nNow send me your question or photo.", parse_mode="Markdown")
 
-# === Helper to add subject to prompt ===
-def build_subject_prompt(user_data, prompt):
-    subject = user_data.get("subject")
-    if subject:
-        prompt = f"You are a {subject} assistant. Answer clearly and concisely.\nQuestion: {prompt}"
-    return prompt
-
-# === Text Handler ===
+# === Handle text messages
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    register_user(user_id)
-    user_data = context.user_data
+    register_user(update.effective_user.id)
     prompt = update.message.text
+    subject = context.user_data.get("subject", None)
 
     await update.message.chat.send_action(action=ChatAction.TYPING)
-    full_prompt = build_subject_prompt(user_data, prompt)
-
-    reply_en = await asyncio.to_thread(hf_text_generate, full_prompt)
-    reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
+    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
 
     sent_msg = await update.message.reply_text(reply_am)
-    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+    translation_cache[str(sent_msg.message_id)] = {
+        "am": reply_am,
+        "en": reply_en,
+        "current": "am"
+    }
 
     keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
     await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# === Image Handler ===
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    register_user(user_id)
-    user_data = context.user_data
-
+# === Handle photos
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
     try:
         photo = update.message.photo[-1]
         file = await photo.get_file()
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
             await file.download_to_drive(custom_path=tmp.name)
-            caption = await asyncio.to_thread(hf_image_caption, tmp.name)
-            full_prompt = build_subject_prompt(user_data, caption)
-
-            reply_en = await asyncio.to_thread(hf_text_generate, full_prompt)
-            reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
+            prompt = f"Describe this image for educational purposes."
+            subject = context.user_data.get("subject", None)
+            reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
 
         sent_msg = await update.message.reply_text(reply_am)
         translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
 
         keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
         await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
-
         os.remove(tmp.name)
 
     except Exception as e:
-        print("Image handler error:", e)
+        logging.error("Photo handler error: %s", e)
         await update.message.reply_text("⚠️ ምስል ማቀናበር አልተሳካም።")
 
-# === Inline Button Handler ===
+# === Handle translate button
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -152,59 +161,27 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data["current"] == "am":
-            await query.message.edit_text(f"🔁 English:\n\n{data['en']}")
+            await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
             data["current"] = "en"
             keyboard = [[InlineKeyboardButton("🌐 Translate to Amharic", callback_data=f"translate|{msg_id}")]]
-            await query.message.reply_text("🌍 Want Amharic?", reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text("🌍 Want Amharic?", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await query.message.edit_text(f"🔁 አማርኛ:\n\n{data['am']}")
+            await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
             data["current"] = "am"
             keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{msg_id}")]]
-            await query.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
-
+            await update.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
-        print("Button Error:", e)
+        logging.error("Button Error: %s", e)
         await query.message.reply_text("⚠️ ቁልፍ ማስኬድ አልተሳካም።")
 
-# === Start Command ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    register_user(user_id)
-    keyboard = [
-        [InlineKeyboardButton("Math", callback_data="subject|math"),
-         InlineKeyboardButton("Physics", callback_data="subject|physics"),
-         InlineKeyboardButton("English", callback_data="subject|english")]
-    ]
-    await update.message.reply_text("👋 Welcome! Choose a subject:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# === Subject selection ===
-async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, subject = query.data.split("|", 1)
-    context.user_data["subject"] = subject
-    await query.message.reply_text(f"✅ You are now in **{subject.capitalize()} assistant** mode.")
-
-# === Admin command ===
-async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ You are not authorized.")
-        return
-    if registered_users:
-        users_list = "\n".join(registered_users)
-        await update.message.reply_text(f"📋 Registered Users:\n\n{users_list}")
-    else:
-        await update.message.reply_text("📋 No registered users.")
-
-# === App setup ===
+# === Main application
 app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("allusers", all_users))
+app.add_handler(CallbackQueryHandler(handle_subject, pattern="subject\\|"))
+app.add_handler(CallbackQueryHandler(handle_button, pattern="translate\\|"))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-app.add_handler(CallbackQueryHandler(handle_button, pattern="^translate"))
-app.add_handler(CallbackQueryHandler(handle_subject, pattern="^subject"))
+app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-print("🚀 Bot is live!")
+logging.info("🚀 TenaBot is live and ready to deploy!")
 asyncio.run(app.run_polling())
