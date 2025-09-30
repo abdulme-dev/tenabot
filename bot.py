@@ -60,7 +60,7 @@ def get_ai_reply(prompt, subject=None):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "gpt-4o-mini",
+                "model": "deepseek/deepseek-chat-v3.1:free",
                 "messages": [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt}
