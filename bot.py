@@ -2,7 +2,6 @@ import os
 import logging
 import asyncio
 import tempfile
-import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -14,16 +13,20 @@ from telegram.ext import (
     CommandHandler,
 )
 from deep_translator import GoogleTranslator
+import requests
+from PIL import Image
+import pytesseract
 
-# === Load API Keys from environment variables
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))  # Replace with your Telegram ID
+# ===== ENV VARIABLES =====
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-# === Logging
+# ===== LOGGING =====
 logging.basicConfig(level=logging.INFO)
 
-# === Users DB
+# ===== USER REGISTRATION =====
 USER_DB_FILE = "users.txt"
 if os.path.exists(USER_DB_FILE):
     with open(USER_DB_FILE, "r") as f:
@@ -43,16 +46,16 @@ def register_user(user_id):
         save_users()
         logging.info(f"✅ New user registered: {user_id}")
 
-# === Translation cache
+# ===== AI FUNCTIONS =====
 translation_cache = {}
 
-# === Subjects
-SUBJECTS = ["Math", "Physics", "Chemistry", "Biology", "English"]
-
-# === OpenRouter AI function
 def get_ai_reply(prompt, subject=None):
+    """Call OpenRouter to get AI response and return English + Amharic"""
     try:
-        system_msg = f"You are a helpful assistant for {subject or 'general'} topics."
+        system_msg = "You are a helpful assistant."
+        if subject:
+            system_msg = f"You are a helpful {subject} assistant."
+
         res = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
@@ -60,72 +63,68 @@ def get_ai_reply(prompt, subject=None):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "deepseek/deepseek-chat-v3.1:free",
+                "model": MODEL,
                 "messages": [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt}
                 ]
             },
-            timeout=30
+            timeout=60
         )
-        data = res.json()
-        content = data["choices"][0]["message"]["content"]
-        # Translate to Amharic
-        reply_am = GoogleTranslator(source="auto", target="am").translate(content)
-        return content, reply_am
+        text_en = res.json()["choices"][0]["message"]["content"]
+        text_am = GoogleTranslator(source="auto", target="am").translate(text_en)
+        return text_en, text_am
     except Exception as e:
         logging.error("AI Error: %s", e)
-        return "⚠️ Couldn't generate a reply.", "⚠️ መልስ ማፍጠር አልተሳካም።"
+        return "⚠️ Couldn't generate a reply.", "⚠️ መልስ ማመን አልተሳካም።"
 
-# === Command: /start
+# ===== TELEGRAM HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     keyboard = [
-        [InlineKeyboardButton(sub, callback_data=f"subject|{sub}") for sub in SUBJECTS]
+        [
+            InlineKeyboardButton("Math", callback_data="subject|Math"),
+            InlineKeyboardButton("Physics", callback_data="subject|Physics"),
+            InlineKeyboardButton("Chemistry", callback_data="subject|Chemistry"),
+        ]
     ]
     await update.message.reply_text(
-        "👋 Welcome! Choose your subject to start:",
+        "👋 Welcome! Choose a subject first:", 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# === Command: /allusers (Admin only)
 async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ You are not authorized.")
+        await update.message.reply_text("⛔ Not authorized.")
         return
     if registered_users:
         await update.message.reply_text("📋 Registered Users:\n" + "\n".join(registered_users))
     else:
         await update.message.reply_text("📋 No registered users found.")
 
-# === Handle subject selection
+# ===== SUBJECT BUTTON =====
 async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     _, subject = query.data.split("|", 1)
     context.user_data["subject"] = subject
-    await query.message.reply_text(f"✅ Subject set to *{subject}*.\nNow send me your question or photo.", parse_mode="Markdown")
+    await query.message.reply_text(f"✅ Subject set to {subject}. Now send your question (text or image).")
 
-# === Handle text messages
+# ===== TEXT MESSAGE =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     prompt = update.message.text
     subject = context.user_data.get("subject", None)
-
     await update.message.chat.send_action(action=ChatAction.TYPING)
-    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
 
+    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
     sent_msg = await update.message.reply_text(reply_am)
-    translation_cache[str(sent_msg.message_id)] = {
-        "am": reply_am,
-        "en": reply_en,
-        "current": "am"
-    }
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
 
     keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
     await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# === Handle photos
+# ===== IMAGE MESSAGE (OCR) =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     try:
@@ -134,7 +133,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
             await file.download_to_drive(custom_path=tmp.name)
-            prompt = f"Describe this image for educational purposes."
+            img = Image.open(tmp.name)
+            text = pytesseract.image_to_string(img).strip()
+            if not text:
+                await update.message.reply_text("⚠️ Couldn't read any text from the image. Please type your question.")
+                return
+
+            prompt = f"Extracted question from image:\n{text}"
             subject = context.user_data.get("subject", None)
             reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
 
@@ -149,39 +154,45 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error("Photo handler error: %s", e)
         await update.message.reply_text("⚠️ ምስል ማቀናበር አልተሳካም።")
 
-# === Handle translate button
+# ===== BUTTON CALLBACK =====
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
         action, msg_id = query.data.split("|", 1)
-        data = translation_cache.get(msg_id)
-        if not data:
-            await query.message.reply_text("⚠️ መልዕክት አልተገኘም።")
-            return
+        if action == "translate":
+            data = translation_cache.get(msg_id)
+            if not data:
+                await query.message.reply_text("⚠️ Message not found.")
+                return
 
-        if data["current"] == "am":
-            await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
-            data["current"] = "en"
-            keyboard = [[InlineKeyboardButton("🌐 Translate to Amharic", callback_data=f"translate|{msg_id}")]]
-            await update.message.reply_text("🌍 Want Amharic?", reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
-            data["current"] = "am"
-            keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{msg_id}")]]
-            await update.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
+            if data["current"] == "am":
+                await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
+                data["current"] = "en"
+                keyboard = [[InlineKeyboardButton("🌐 Translate to Amharic", callback_data=f"translate|{msg_id}")]]
+                await query.message.reply_text("🌍 Want Amharic?", reply_markup=InlineKeyboardMarkup(keyboard))
+            else:
+                await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
+                data["current"] = "am"
+                keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{msg_id}")]]
+                await query.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif action == "subject":
+            await handle_subject(update, context)
+
     except Exception as e:
         logging.error("Button Error: %s", e)
-        await query.message.reply_text("⚠️ ቁልፍ ማስኬድ አልተሳካም።")
+        await query.message.reply_text("⚠️ Button failed.")
 
-# === Main application
+# ===== SETUP APP =====
 app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("allusers", all_users))
-app.add_handler(CallbackQueryHandler(handle_subject, pattern="subject\\|"))
-app.add_handler(CallbackQueryHandler(handle_button, pattern="translate\\|"))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(CallbackQueryHandler(handle_button))
 
-logging.info("🚀 TenaBot is live and ready to deploy!")
-asyncio.run(app.run_polling())
+print("🚀 TenaBot is live...")
+
+if __name__ == "__main__":
+    asyncio.run(app.run_polling())
