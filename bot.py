@@ -2,25 +2,15 @@ import os
 import logging
 import asyncio
 import tempfile
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    CallbackQueryHandler,
-    CommandHandler,
-)
-from deep_translator import GoogleTranslator
-import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAction
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler, CommandHandler
 from PIL import Image
 import pytesseract
+import img2pdf
+import requests
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 # ===== LOGGING =====
@@ -45,38 +35,6 @@ def register_user(user_id):
         registered_users.add(user_id)
         save_users()
         logging.info(f"✅ New user registered: {user_id}")
-
-# ===== AI FUNCTIONS =====
-translation_cache = {}
-
-def get_ai_reply(prompt, subject=None):
-    """Call OpenRouter to get AI response and return English + Amharic"""
-    try:
-        system_msg = "You are a helpful assistant."
-        if subject:
-            system_msg = f"You are a helpful {subject} assistant."
-
-        res = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ]
-            },
-            timeout=60
-        )
-        text_en = res.json()["choices"][0]["message"]["content"]
-        text_am = GoogleTranslator(source="auto", target="am").translate(text_en)
-        return text_en, text_am
-    except Exception as e:
-        logging.error("AI Error: %s", e)
-        return "⚠️ Couldn't generate a reply.", "⚠️ መልስ ማመን አልተሳካም።"
 
 # ===== TELEGRAM HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,21 +66,36 @@ async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     _, subject = query.data.split("|", 1)
     context.user_data["subject"] = subject
-    await query.message.reply_text(f"✅ Subject set to {subject}. Now send your question (text or image).")
+    keyboard = [
+        [InlineKeyboardButton("📝 Worksheet", callback_data="task|worksheet")],
+        [InlineKeyboardButton("🏠 Homework", callback_data="task|homework")],
+        [InlineKeyboardButton("📄 Assignment", callback_data="task|assignment")],
+    ]
+    await query.message.reply_text(
+        f"✅ Subject set to {subject}. Choose a task type:", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-# ===== TEXT MESSAGE =====
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user.id)
-    prompt = update.message.text
-    subject = context.user_data.get("subject", None)
-    await update.message.chat.send_action(action=ChatAction.TYPING)
+# ===== TASK BUTTON =====
+async def handle_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, task_type = query.data.split("|", 1)
+    subject = context.user_data.get("subject")
+    if not subject:
+        await query.message.reply_text("⚠️ Please select a subject first.")
+        return
+
+    prompt = f"Create a {task_type} for {subject} with multiple questions and answers."
+    await query.message.chat.send_action(action=ChatAction.TYPING)
 
     reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
-    sent_msg = await update.message.reply_text(reply_am)
+    sent_msg = await query.message.reply_text(reply_am)
+
     translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
 
     keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
-    await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== IMAGE MESSAGE (OCR) =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,8 +132,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
-        action, msg_id = query.data.split("|", 1)
+        action, data = query.data.split("|", 1)
         if action == "translate":
+            msg_id = data
             data = translation_cache.get(msg_id)
             if not data:
                 await query.message.reply_text("⚠️ Message not found.")
@@ -170,15 +144,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
                 data["current"] = "en"
                 keyboard = [[InlineKeyboardButton("🌐 Translate to Amharic", callback_data=f"translate|{msg_id}")]]
-                await query.message.reply_text("🌍 Want Amharic?", reply_markup=InlineKeyboardMarkup(keyboard))
+                await query.message.reply_text("🌍 አማርኛ ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
             else:
                 await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
                 data["current"] = "am"
                 keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{msg_id}")]]
-                await query.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
+                await query.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
         elif action == "subject":
             await handle_subject(update, context)
+        elif action == "task":
+            await handle_task(update, context)
 
     except Exception as e:
         logging.error("Button Error: %s", e)
