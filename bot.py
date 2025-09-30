@@ -1,146 +1,210 @@
-import os, logging, asyncio, time
-from dotenv import load_dotenv
+import os
+import logging
+import asyncio
+import tempfile
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes,
-    MessageHandler, filters,
-    CallbackQueryHandler, CommandHandler
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    CommandHandler,
 )
-import requests
 from deep_translator import GoogleTranslator
-from collections import defaultdict
 
-# === Load environment variables ===
-load_dotenv()
+# === Load keys from environment variables ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = "mistralai/mistral-7b-instruct"
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))  # default 0 if not set
 
-# === Logging setup ===
+# HuggingFace free models
+HF_TEXT_MODEL = os.getenv("HF_TEXT_MODEL", "google/flan-t5-small")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "Salesforce/blip-image-captioning-base")
+
+# === Logging & cache ===
 logging.basicConfig(level=logging.INFO)
-
-# === User Tracking and Rate Limiting ===
-user_set = set()
-ADMIN_IDS = os.getenv("ADMIN_ID")  # Replace with your Telegram ID
-RATE_LIMIT = 5  # messages
-TIME_WINDOW = 10 * 10  # 1 hour
-user_requests = defaultdict(list)
-
 translation_cache = {}
+registered_users = set()
+USER_DB_FILE = "users.txt"
 
-# === Get AI reply ===
-def get_ai_reply(prompt):
+# === Load registered users ===
+if os.path.exists(USER_DB_FILE):
+    with open(USER_DB_FILE, "r") as f:
+        registered_users = set(line.strip() for line in f if line.strip())
+
+def save_users():
+    with open(USER_DB_FILE, "w") as f:
+        for uid in registered_users:
+            f.write(f"{uid}\n")
+
+def register_user(user_id):
+    user_id = str(user_id)
+    if user_id not in registered_users:
+        registered_users.add(user_id)
+        save_users()
+        print(f"✅ New user registered: {user_id}")
+
+# === HuggingFace text generation ===
+def hf_text_generate(prompt):
     try:
-        res = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://yourdomain.com"
-            },
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt}
-                ]
-            }
-        )
-        return res.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logging.error(f"Chat error: {e}")
+        url = f"https://api-inference.huggingface.co/models/{HF_TEXT_MODEL}"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        data = {"inputs": prompt}
+        res = requests.post(url, headers=headers, json=data, timeout=60)
+        output = res.json()
+        if isinstance(output, list) and "generated_text" in output[0]:
+            return output[0]["generated_text"]
         return "⚠️ Couldn't generate a reply."
+    except Exception as e:
+        print("HF Text Error:", e)
+        return "⚠️ Error generating text."
 
-# === Translate to Amharic ===
+# === HuggingFace image captioning ===
+def hf_image_caption(image_path):
+    try:
+        url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        with open(image_path, "rb") as f:
+            res = requests.post(url, headers=headers, files={"inputs": f}, timeout=60)
+        output = res.json()
+        if isinstance(output, dict) and "error" in output:
+            return "⚠️ Couldn't process the image."
+        return output[0].get("generated_text", "❌ Couldn't describe the image.")
+    except Exception as e:
+        print("HF Image Error:", e)
+        return "⚠️ Image processing failed."
+
+# === Translate functions ===
 def translate_to_amharic(text):
-    try:
-        return GoogleTranslator(source="auto", target="en").translate(text)
-    except Exception as e:
-        logging.error(f"Translation error: {e}")
-        return "⚠️ Translation failed."
+    return GoogleTranslator(source="auto", target="am").translate(text=text)
 
-# === Rate limit logic ===
-def is_rate_limited(user_id):
-    now = time.time()
-    requests = user_requests[user_id]
-    user_requests[user_id] = [t for t in requests if now - t < TIME_WINDOW]
-    if len(user_requests[user_id]) >= RATE_LIMIT:
-        return True
-    user_requests[user_id].append(now)
-    return False
+def translate_to_english(text):
+    return GoogleTranslator(source="auto", target="en").translate(text=text)
 
-# === /start ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_set.add(user.id)
-    logging.info(f"/start by {user.id} - @{user.username}")
+# === Helper to add subject to prompt ===
+def build_subject_prompt(user_data, prompt):
+    subject = user_data.get("subject")
+    if subject:
+        prompt = f"You are a {subject} assistant. Answer clearly and concisely.\nQuestion: {prompt}"
+    return prompt
 
-    # Save user info to file
-    user_info = f"{user.id},{user.username or 'NoUsername'},{user.first_name or ''},{user.last_name or ''}\n"
-    try:
-        # Avoid duplicate entries
-        if not os.path.exists("users.txt") or str(user.id) not in open("users.txt", encoding="utf-8").read():
-            with open("users.txt", "a", encoding="utf-8") as f:
-                f.write(user_info)
-    except Exception as e:
-        logging.error(f"Error saving user: {e}")
-
-    await update.message.reply_text("💬 Send me a message and I'll reply!")
-
-# === /users ===
-async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in ADMIN_IDS:
-        await update.message.reply_text(f"👥 Total unique users: {len(user_set)}")
-    else:
-        await update.message.reply_text("❌ You're not authorized to view user stats.")
-
-# === Handle text ===
+# === Text Handler ===
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_set.add(user.id)
-    logging.info(f"Text from {user.id} - @{user.username}: {update.message.text}")
-
-    if is_rate_limited(user.id):
-        await update.message.reply_text("⚠️ Rate limit reached. Try again in a while.")
-        return
-
+    user_id = update.effective_user.id
+    register_user(user_id)
+    user_data = context.user_data
     prompt = update.message.text
+
     await update.message.chat.send_action(action=ChatAction.TYPING)
+    full_prompt = build_subject_prompt(user_data, prompt)
 
-    reply = await asyncio.to_thread(get_ai_reply, prompt)
-    sent_msg = await update.message.reply_text(reply)
+    reply_en = await asyncio.to_thread(hf_text_generate, full_prompt)
+    reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
 
-    translation_cache[str(sent_msg.message_id)] = reply
-    keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"t|{sent_msg.message_id}")]]
-    await update.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
+    sent_msg = await update.message.reply_text(reply_am)
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
 
-# === Handle button ===
+    keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
+    await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# === Image Handler ===
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    register_user(user_id)
+    user_data = context.user_data
+
+    try:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            await file.download_to_drive(custom_path=tmp.name)
+            caption = await asyncio.to_thread(hf_image_caption, tmp.name)
+            full_prompt = build_subject_prompt(user_data, caption)
+
+            reply_en = await asyncio.to_thread(hf_text_generate, full_prompt)
+            reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
+
+        sent_msg = await update.message.reply_text(reply_am)
+        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+
+        keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
+        await update.message.reply_text("🌍 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        os.remove(tmp.name)
+
+    except Exception as e:
+        print("Image handler error:", e)
+        await update.message.reply_text("⚠️ ምስል ማቀናበር አልተሳካም።")
+
+# === Inline Button Handler ===
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
         action, msg_id = query.data.split("|", 1)
-        if action == "t":
-            original = translation_cache.get(msg_id)
-            if original:
-                translated = await asyncio.to_thread(translate_to_amharic, original)
-                await query.message.reply_text(f"🔁 Translated:\n\n{translated}")
+        data = translation_cache.get(msg_id)
+        if not data:
+            await query.message.reply_text("⚠️ መልዕክት አልተገኘም።")
+            return
+
+        if data["current"] == "am":
+            await query.message.edit_text(f"🔁 English:\n\n{data['en']}")
+            data["current"] = "en"
+            keyboard = [[InlineKeyboardButton("🌐 Translate to Amharic", callback_data=f"translate|{msg_id}")]]
+            await query.message.reply_text("🌍 Want Amharic?", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await query.message.edit_text(f"🔁 አማርኛ:\n\n{data['am']}")
+            data["current"] = "am"
+            keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{msg_id}")]]
+            await query.message.reply_text("🌍 Need translation?", reply_markup=InlineKeyboardMarkup(keyboard))
+
     except Exception as e:
-        logging.error(f"Button error: {e}")
+        print("Button Error:", e)
+        await query.message.reply_text("⚠️ ቁልፍ ማስኬድ አልተሳካም።")
 
-# === Run bot ===
-def run_bot():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+# === Start Command ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    register_user(user_id)
+    keyboard = [
+        [InlineKeyboardButton("Math", callback_data="subject|math"),
+         InlineKeyboardButton("Physics", callback_data="subject|physics"),
+         InlineKeyboardButton("English", callback_data="subject|english")]
+    ]
+    await update.message.reply_text("👋 Welcome! Choose a subject:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("users", show_users))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(handle_button))
+# === Subject selection ===
+async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, subject = query.data.split("|", 1)
+    context.user_data["subject"] = subject
+    await query.message.reply_text(f"✅ You are now in **{subject.capitalize()} assistant** mode.")
 
-    logging.info("🚀 TenaBot is live.")
-    app.run_polling()
+# === Admin command ===
+async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+    if registered_users:
+        users_list = "\n".join(registered_users)
+        await update.message.reply_text(f"📋 Registered Users:\n\n{users_list}")
+    else:
+        await update.message.reply_text("📋 No registered users.")
 
-if __name__ == "__main__":
-    run_bot()
+# === App setup ===
+app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("allusers", all_users))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+app.add_handler(CallbackQueryHandler(handle_button, pattern="^translate"))
+app.add_handler(CallbackQueryHandler(handle_subject, pattern="^subject"))
+
+print("🚀 Bot is live!")
+asyncio.run(app.run_polling())
