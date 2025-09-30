@@ -2,17 +2,14 @@ import os
 import logging
 import asyncio
 import tempfile
-import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler, CommandHandler
 from PIL import Image
-import requests
 import pytesseract
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 # ===== LOGGING =====
@@ -59,39 +56,22 @@ def task_keyboard():
         [InlineKeyboardButton("📄 Assignment", callback_data="task|assignment")],
     ])
 
-# ===== OPENROUTER API CALL =====
-def openrouter_api_call(prompt):
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    data = {
-        "model": "deepseek/deepseek-r1:free",
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        try:
-            resp_json = response.json()
-            # Extract AI text output
-            return resp_json["choices"][0]["message"]["content"]
-        except Exception as e:
-            logging.error(f"JSON parse error: {e}")
-            return "⚠️ Failed to parse AI response."
-    else:
-        logging.error(f"OpenRouter API Error {response.status_code}: {response.text}")
-        return "⚠️ Failed to generate content."
+# ===== AI REPLY FUNCTION =====
+def get_ai_reply(prompt, subject=None):
+    """ Replace with real AI API call (DeepSeek/OpenRouter) """
+    reply_en = f"[{subject or 'General'}] English AI reply: {prompt}"
+    reply_am = f"[{subject or 'General'}] Amharic AI reply: {prompt}"
+    return reply_en, reply_am
 
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     await update.message.reply_text(
-        "👋 Welcome! Choose a subject first:",
+        "👋 Welcome to MiniBot! Choose a subject:",
         reply_markup=subject_keyboard()
     )
 
-# ===== LIST ALL USERS (ADMIN) =====
+# ===== LIST USERS (ADMIN) =====
 async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
@@ -107,7 +87,7 @@ async def handle_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     _, subject = query.data.split("|", 1)
     context.user_data["subject"] = subject
-    await query.message.reply_text(f"✅ Subject set to {subject}. Choose a task type:", reply_markup=task_keyboard())
+    await query.message.edit_text(f"✅ Subject set to {subject}. Choose a task:", reply_markup=task_keyboard())
 
 # ===== TASK HANDLER =====
 async def handle_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,18 +96,20 @@ async def handle_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, task_type = query.data.split("|", 1)
     subject = context.user_data.get("subject")
     if not subject:
-        await query.message.reply_text("⚠️ Please select a subject first.", reply_markup=subject_keyboard())
+        await query.message.edit_text("⚠️ Please select a subject first:", reply_markup=subject_keyboard())
         return
 
     prompt = f"Create a {task_type} for {subject} with multiple questions and answers."
     await query.message.chat.send_action(action=ChatAction.TYPING)
-    reply_text = await asyncio.to_thread(openrouter_api_call, prompt)
-    sent_msg = await query.message.reply_text(reply_text)
 
-    translation_cache[str(sent_msg.message_id)] = {"am": reply_text, "en": reply_text, "current": "am"}
+    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
+    sent_msg = await query.message.reply_text(reply_am)
 
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+
+    # Inline translation toggle
     keyboard = [
-        [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")],
+        [InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")],
         [InlineKeyboardButton("🔄 Change Subject", callback_data="change_subject")]
     ]
     await query.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -137,18 +119,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     subject = context.user_data.get("subject")
     if not subject:
-        await update.message.reply_text("⚠️ Please select a subject first:", reply_markup=subject_keyboard())
+        await update.message.reply_text("⚠️ Select a subject first:", reply_markup=subject_keyboard())
         return
 
     prompt = f"[{subject}] {update.message.text}"
     await update.message.chat.send_action(action=ChatAction.TYPING)
-    reply_text = await asyncio.to_thread(openrouter_api_call, prompt)
-    sent_msg = await update.message.reply_text(reply_text)
 
-    translation_cache[str(sent_msg.message_id)] = {"am": reply_text, "en": reply_text, "current": "am"}
+    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
+    sent_msg = await update.message.reply_text(reply_am)
+
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
 
     keyboard = [
-        [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")],
+        [InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")],
         [InlineKeyboardButton("🔄 Change Subject", callback_data="change_subject")]
     ]
     await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -158,7 +141,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     subject = context.user_data.get("subject")
     if not subject:
-        await update.message.reply_text("⚠️ Please select a subject first:", reply_markup=subject_keyboard())
+        await update.message.reply_text("⚠️ Select a subject first:", reply_markup=subject_keyboard())
         return
 
     try:
@@ -170,28 +153,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             img = Image.open(tmp.name)
             text = pytesseract.image_to_string(img).strip()
             if not text:
-                await update.message.reply_text("⚠️ Couldn't read any text from the image. Please type your question.")
+                await update.message.reply_text("⚠️ Couldn't read text. Please type your question.")
                 return
 
-            # Encode image to Base64
-            with open(tmp.name, "rb") as f:
-                img_base64 = base64.b64encode(f.read()).decode("utf-8")
-            prompt = f"[image: {img_base64}] [{subject}] Extracted question:\n{text}"
+            prompt = f"[{subject}] Extracted question:\n{text}"
+            reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt, subject)
 
-            reply_text = await asyncio.to_thread(openrouter_api_call, prompt)
-
-        sent_msg = await update.message.reply_text(reply_text)
-        translation_cache[str(sent_msg.message_id)] = {"am": reply_text, "en": reply_text, "current": "am"}
+        sent_msg = await update.message.reply_text(reply_am)
+        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
 
         keyboard = [
-            [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")],
+            [InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")],
             [InlineKeyboardButton("🔄 Change Subject", callback_data="change_subject")]
         ]
         await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
         os.remove(tmp.name)
 
     except Exception as e:
-        logging.error(f"Photo handler error: {e}")
+        logging.error("Photo handler error: %s", e)
         await update.message.reply_text("⚠️ Image processing failed.")
 
 # ===== BUTTON HANDLER =====
@@ -200,7 +179,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     try:
         if query.data == "change_subject":
-            await query.message.reply_text("Select a new subject:", reply_markup=subject_keyboard())
+            await query.message.edit_text("Select a new subject:", reply_markup=subject_keyboard())
             return
 
         action, data = query.data.split("|", 1)
@@ -212,12 +191,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("⚠️ Message not found.")
                 return
 
-            if data["current"] == "am":
-                await query.message.reply_text(f"🔁 English:\n\n{data['en']}")
-                data["current"] = "en"
-            else:
-                await query.message.reply_text(f"🔁 አማርኛ:\n\n{data['am']}")
-                data["current"] = "am"
+            new_text = data["en"] if data["current"] == "am" else data["am"]
+            data["current"] = "en" if data["current"] == "am" else "am"
+            await query.message.edit_text(new_text)
 
         elif action == "subject":
             await handle_subject(update, context)
@@ -225,7 +201,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_task(update, context)
 
     except Exception as e:
-        logging.error(f"Button Error: {e}")
+        logging.error("Button Error: %s", e)
         await query.message.reply_text("⚠️ Button failed.")
 
 # ===== SETUP BOT =====
@@ -236,7 +212,7 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(CallbackQueryHandler(handle_button))
 
-print("🚀 TenaBot is live...")
+print("🚀 MiniBot is live...")
 
 if __name__ == "__main__":
     asyncio.run(app.run_polling())
