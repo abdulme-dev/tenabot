@@ -1,3 +1,0 @@
-ffmpeg
-tesseract-ocr
-libavcodec-extra
