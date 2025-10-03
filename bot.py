@@ -11,6 +11,7 @@ from telegram.ext import (
 )
 from PIL import Image
 import pytesseract
+from googletrans import Translator
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -42,7 +43,18 @@ def register_user(user_id):
 # ===== TRANSLATION CACHE =====
 translation_cache = {}
 
-# ===== AI REPLY FUNCTION (OpenRouter) =====
+# ===== GOOGLE TRANSLATE =====
+translator = Translator()
+
+def translate_to_amharic(text: str) -> str:
+    try:
+        result = translator.translate(text, dest="am")
+        return result.text
+    except Exception as e:
+        logging.error("Translation error: %s", e)
+        return "⚠️ Translation failed."
+
+# ===== AI REPLY FUNCTION (English from OpenRouter) =====
 def get_ai_reply(prompt):
     try:
         headers = {
@@ -51,11 +63,10 @@ def get_ai_reply(prompt):
         }
 
         data = {
-            "model": "deepseek/deepseek-chat-v3.1:free",
+            "model": "deepseek/deepseek-r1:free",
             "messages": [
                 {"role": "system", "content": "You are a helpful tutor for Ethiopian students. Always explain clearly."},
                 {"role": "user", "content": prompt},
-                {"role": "user", "content": "Translate the previous answer into Amharic."}
             ]
         }
 
@@ -67,32 +78,16 @@ def get_ai_reply(prompt):
         )
 
         if response.status_code != 200:
-            return f"⚠️ OpenRouter Error {response.status_code}: {response.text}", f"⚠️ ስህተት: {response.text}"
+            err = f"⚠️ OpenRouter Error {response.status_code}: {response.text}"
+            return err, err
 
         res_json = response.json()
-        # First reply (English)
-        reply_en = res_json["choices"][0]["message"]["content"]
-        # Second reply (Amharic) from AI
-        reply_am = reply_en  # fallback if Amharic fails
+        reply_en = res_json["choices"][0]["message"]["content"].strip()
 
-        # Ask for Amharic translation separately
-        trans_data = {
-            "model": "deepseek/deepseek-r1:free",
-            "messages": [
-                {"role": "system", "content": "Translate the following text into Amharic."},
-                {"role": "user", "content": reply_en}
-            ]
-        }
-        trans_resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=trans_data,
-            timeout=60
-        )
-        if trans_resp.status_code == 200:
-            reply_am = trans_resp.json()["choices"][0]["message"]["content"]
+        # Translate into Amharic
+        reply_am = translate_to_amharic(reply_en)
 
-        return reply_en.strip(), reply_am.strip()
+        return reply_en, reply_am
 
     except Exception as e:
         logging.error("AI Error: %s", e)
@@ -101,7 +96,7 @@ def get_ai_reply(prompt):
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን በአማርኛ ወይም በእንግሊዝኛ ይጻፉ።")
+    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን ይጻፉ። (Default reply is in Amharic, you can switch to English)")
 
 # ===== TEXT HANDLER =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,7 +181,7 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(CallbackQueryHandler(handle_button))
 
-print("🚀 EduBot is live...")
+print("🚀 EduBot with Google Translate is live...")
 
 if __name__ == "__main__":
     asyncio.run(app.run_polling())
