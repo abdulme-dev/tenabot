@@ -1,8 +1,5 @@
-requests
-pillow
-pytesseract
-googletrans==4.0.0-rc1
-SpeechRecognition
-pydub
-gTTS
 python-telegram-bot==20.6
+Pillow==10.0.0
+pytesseract==0.3.10
+requests==2.31.0
+googletrans==4.0.0-rc1
