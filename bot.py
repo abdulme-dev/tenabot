@@ -4,11 +4,16 @@ import asyncio
 import tempfile
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, MessageHandler, filters, 
+    CallbackQueryHandler, CommandHandler
+)
 from PIL import Image
 import pytesseract
 from googletrans import Translator
 import requests
+import speech_recognition as sr
+from pydub import AudioSegment
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -43,9 +48,6 @@ translation_cache = {}
 
 # ===== AI CALL FUNCTION =====
 def get_ai_reply(prompt):
-    """
-    Use OpenRouter free API (DeepSeek) to generate English response
-    """
     try:
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -78,7 +80,7 @@ def translate_to_amharic(text):
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-    await update.message.reply_text("👋 Welcome! Send a question (text or photo) to generate AI response in Amharic.")
+    await update.message.reply_text("👋 Welcome! Send a question (text, photo, or voice) to generate AI response in Amharic.")
 
 # ===== LIST USERS (ADMIN) =====
 async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -90,12 +92,9 @@ async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📋 No registered users found.")
 
-# ===== HANDLE TEXT =====
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user.id)
-    prompt = update.message.text
+# ===== GENERIC AI RESPONSE FUNCTION =====
+async def generate_response(prompt, update):
     await update.message.chat.send_action(action=ChatAction.TYPING)
-    
     reply_en = await asyncio.to_thread(get_ai_reply, prompt)
     reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
     
@@ -106,6 +105,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]
     ]
     await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# ===== HANDLE TEXT =====
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    prompt = update.message.text
+    await generate_response(prompt, update)
 
 # ===== HANDLE PHOTO =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -120,22 +125,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not text:
                 await update.message.reply_text("⚠️ Couldn't read text. Please type your question.")
                 return
-            
-            await update.message.chat.send_action(action=ChatAction.TYPING)
-            reply_en = await asyncio.to_thread(get_ai_reply, text)
-            reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
-        
-        sent_msg = await update.message.reply_text(reply_am)
-        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
-
-        keyboard = [
-            [InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]
-        ]
-        await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+            update.message.text = text
+            await generate_response(text, update)
         os.remove(tmp.name)
     except Exception as e:
         logging.error("Photo handler error: %s", e)
         await update.message.reply_text("⚠️ Image processing failed.")
+
+# ===== HANDLE VOICE =====
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    try:
+        voice = update.message.voice
+        file = await voice.get_file()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_ogg:
+            await file.download_to_drive(custom_path=tmp_ogg.name)
+            tmp_wav_path = tmp_ogg.name.replace(".ogg", ".wav")
+            AudioSegment.from_ogg(tmp_ogg.name).export(tmp_wav_path, format="wav")
+            
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(tmp_wav_path) as source:
+                audio = recognizer.record(source)
+                text = recognizer.recognize_google(audio)
+            
+            update.message.text = text
+            await generate_response(text, update)
+        
+        os.remove(tmp_ogg.name)
+        os.remove(tmp_wav_path)
+    except Exception as e:
+        logging.error("Voice handler error: %s", e)
+        await update.message.reply_text("⚠️ Voice recognition failed.")
 
 # ===== BUTTON HANDLER =====
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -162,6 +182,7 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("allusers", all_users))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 app.add_handler(CallbackQueryHandler(handle_button))
 
 print("🚀 MiniBot is live...")
