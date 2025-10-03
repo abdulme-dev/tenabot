@@ -5,7 +5,10 @@ import tempfile
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, MessageHandler,
+    filters, CallbackQueryHandler, CommandHandler
+)
 from PIL import Image
 import pytesseract
 
@@ -39,71 +42,66 @@ def register_user(user_id):
 # ===== TRANSLATION CACHE =====
 translation_cache = {}
 
-# ===== AI CALL (English only) =====
+# ===== AI REPLY FUNCTION (OpenRouter) =====
 def get_ai_reply(prompt):
-    """
-    Calls OpenRouter with DeepSeek and returns English text only.
-    """
     try:
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         }
+
         data = {
             "model": "deepseek/deepseek-r1:free",
             "messages": [
-                {"role": "system", "content": "You are a helpful tutor. Always respond in English."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "You are a helpful tutor for Ethiopian students. Always explain clearly."},
+                {"role": "user", "content": prompt},
+                {"role": "user", "content": "Translate the previous answer into Amharic."}
             ]
         }
 
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data, timeout=60)
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=60
+        )
 
-        if response.status_code == 200:
-            reply_text = response.json()["choices"][0]["message"]["content"]
-            return reply_text
-        else:
-            logging.error(f"OpenRouter Error: {response.text}")
-            return "⚠️ Failed to generate response."
+        if response.status_code != 200:
+            return f"⚠️ OpenRouter Error {response.status_code}: {response.text}", f"⚠️ ስህተት: {response.text}"
 
-    except Exception as e:
-        logging.error(f"AI Request Error: {e}")
-        return "⚠️ AI Error"
+        res_json = response.json()
+        # First reply (English)
+        reply_en = res_json["choices"][0]["message"]["content"]
+        # Second reply (Amharic) from AI
+        reply_am = reply_en  # fallback if Amharic fails
 
-# ===== TRANSLATE EN → AM =====
-def translate_to_amharic(english_text):
-    """
-    Simple call to OpenRouter for translation EN → AM
-    """
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        data = {
+        # Ask for Amharic translation separately
+        trans_data = {
             "model": "deepseek/deepseek-r1:free",
             "messages": [
-                {"role": "system", "content": "Translate this text into Amharic. Only return the translation."},
-                {"role": "user", "content": english_text}
+                {"role": "system", "content": "Translate the following text into Amharic."},
+                {"role": "user", "content": reply_en}
             ]
         }
+        trans_resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=trans_data,
+            timeout=60
+        )
+        if trans_resp.status_code == 200:
+            reply_am = trans_resp.json()["choices"][0]["message"]["content"]
 
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data, timeout=60)
-
-        if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
-        else:
-            logging.error(f"Translation Error: {response.text}")
-            return "⚠️ ትርጉም አልተሳካም።"
+        return reply_en.strip(), reply_am.strip()
 
     except Exception as e:
-        logging.error(f"Translation Request Error: {e}")
-        return "⚠️ ትርጉም ስህተት"
+        logging.error("AI Error: %s", e)
+        return f"⚠️ AI Error: {str(e)}", f"⚠️ AI ስህተት: {str(e)}"
 
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-    await update.message.reply_text("👋 እንኳን ደህና መጡ። ጥያቄዎን ይጻፉ ወይም ምስል ይላኩ።")
+    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን በአማርኛ ወይም በእንግሊዝኛ ይጻፉ።")
 
 # ===== TEXT HANDLER =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,14 +109,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     await update.message.chat.send_action(action=ChatAction.TYPING)
 
-    english = await asyncio.to_thread(get_ai_reply, prompt)
-    amharic = await asyncio.to_thread(translate_to_amharic, english)
+    reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt)
+    sent_msg = await update.message.reply_text(reply_am)
 
-    sent_msg = await update.message.reply_text(f"🇪🇹 {amharic}")
+    translation_cache[str(sent_msg.message_id)] = {
+        "am": reply_am,
+        "en": reply_en,
+        "current": "am"
+    }
 
-    translation_cache[str(sent_msg.message_id)] = {"am": f"🇪🇹 {amharic}", "en": f"🇬🇧 {english}", "current": "am"}
-    keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
-    await update.message.reply_text("👉 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
+    await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== PHOTO HANDLER =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,23 +132,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file.download_to_drive(custom_path=tmp.name)
             img = Image.open(tmp.name)
             text = pytesseract.image_to_string(img).strip()
-            if not text:
-                await update.message.reply_text("⚠️ ምንም ጽሁፍ አልተገኘም።")
-                return
+            os.remove(tmp.name)
 
-            english = await asyncio.to_thread(get_ai_reply, text)
-            amharic = await asyncio.to_thread(translate_to_amharic, english)
+        if not text:
+            await update.message.reply_text("⚠️ No text detected in image. Try again.")
+            return
 
-        sent_msg = await update.message.reply_text(f"🇪🇹 {amharic}")
-        translation_cache[str(sent_msg.message_id)] = {"am": f"🇪🇹 {amharic}", "en": f"🇬🇧 {english}", "current": "am"}
+        await update.message.chat.send_action(action=ChatAction.TYPING)
+        reply_en, reply_am = await asyncio.to_thread(get_ai_reply, text)
 
-        keyboard = [[InlineKeyboardButton("🌐 Translate to English", callback_data=f"translate|{sent_msg.message_id}")]]
-        await update.message.reply_text("👉 ትርጉም ይፈልጋሉ?", reply_markup=InlineKeyboardMarkup(keyboard))
-        os.remove(tmp.name)
+        sent_msg = await update.message.reply_text(reply_am)
+        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+
+        keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
+        await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     except Exception as e:
-        logging.error(f"Photo handler error: {e}")
-        await update.message.reply_text("⚠️ ምስል ማቀናበር አልተሳካም።")
+        logging.error("Photo handler error: %s", e)
+        await update.message.reply_text(f"⚠️ Image processing failed: {str(e)}")
 
 # ===== BUTTON HANDLER =====
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,6 +158,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         action, data = query.data.split("|", 1)
+
         if action == "translate":
             msg_id = data
             data = translation_cache.get(msg_id)
@@ -166,17 +169,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if data["current"] == "am":
                 new_text = data["en"]
                 data["current"] = "en"
-                new_btn = "Translate to Amharic"
             else:
                 new_text = data["am"]
                 data["current"] = "am"
-                new_btn = "Translate to English"
 
-            await query.message.edit_text(new_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🌐 {new_btn}", callback_data=f"translate|{msg_id}")]]))
+            await query.message.edit_text(new_text)
 
     except Exception as e:
-        logging.error(f"Button Error: {e}")
-        await query.message.reply_text("⚠️ Button failed.")
+        logging.error("Button Error: %s", e)
+        await query.message.reply_text(f"⚠️ Button failed: {str(e)}")
 
 # ===== SETUP BOT =====
 app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -185,7 +186,7 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(CallbackQueryHandler(handle_button))
 
-print("🚀 Amharic Study Bot (DeepSeek + OpenRouter) is live...")
+print("🚀 EduBot is live...")
 
 if __name__ == "__main__":
     asyncio.run(app.run_polling())
