@@ -64,28 +64,31 @@ def get_ai_reply(prompt):
             "Content-Type": "application/json"
         }
         data = {
-            "model": "deepseek-r1:free",
+            "model": "deepseek/deepseek-chat:free",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 500
         }
-        r = requests.post(url, headers=headers, json=data, timeout=20)
+        r = requests.post(url, headers=headers, json=data, timeout=30)
         r.raise_for_status()
         response = r.json()
         reply_en = response['choices'][0]['message']['content']
         return reply_en
     except Exception as e:
         logging.error("AI API error: %s", e)
-        return "⚠️ AI API Error. Try again later."
+        return "⚠️ AI service is temporarily unavailable. Please try again later."
 
 # ===== GOOGLE TRANSLATE =====
 translator = Translator()
 
 def translate_to_amharic(text):
     try:
+        # Handle empty or very short text
+        if not text or len(text.strip()) < 2:
+            return text
         return translator.translate(text, dest='am').text
     except Exception as e:
         logging.error("Translation error: %s", e)
-        return "⚠️ Translation failed."
+        return text  # Return original text if translation fails
 
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,7 +109,7 @@ async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if registered_users:
         user_list = "📋 የተመዘገቡ ተጠቃሚዎች:\n\n"
-        for i, user_id in enumerate(registered_users, 1):
+        for i, user_id in enumerate(sorted(registered_users), 1):
             user_list += f"{i}. {user_id}\n"
         
         # Split if message is too long
@@ -121,78 +124,120 @@ async def all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def generate_response(prompt, update):
     await update.message.chat.send_action(action=ChatAction.TYPING)
     
-    # Get AI response in English
-    reply_en = await asyncio.to_thread(get_ai_reply, prompt)
-    
-    # Translate to Amharic
-    reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
-    
-    # Send Amharic response first
-    sent_msg = await update.message.reply_text(reply_am)
-    
-    # Store both versions in cache
-    translation_cache[str(sent_msg.message_id)] = {
-        "am": reply_am, 
-        "en": reply_en, 
-        "current": "am"  # Currently showing Amharic
-    }
-    
-    # Add translate button to show English version
-    keyboard = [
-        [InlineKeyboardButton("🌐 ወደ እንግሊዘኛ ተርጉም", callback_data=f"translate|{sent_msg.message_id}")]
-    ]
-    await update.message.reply_text("ምርጫዎች:", reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        # Get AI response in English
+        reply_en = await asyncio.to_thread(get_ai_reply, prompt)
+        
+        # Translate to Amharic
+        reply_am = await asyncio.to_thread(translate_to_amharic, reply_en)
+        
+        # Send Amharic response first
+        sent_msg = await update.message.reply_text(reply_am)
+        
+        # Store both versions in cache
+        translation_cache[str(sent_msg.message_id)] = {
+            "am": reply_am, 
+            "en": reply_en, 
+            "current": "am"  # Currently showing Amharic
+        }
+        
+        # Add translate button to show English version
+        keyboard = [
+            [InlineKeyboardButton("🌐 ወደ እንግሊዘኛ ተርጉም", callback_data=f"translate|{sent_msg.message_id}")]
+        ]
+        await update.message.reply_text("ምርጫዎች:", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    except Exception as e:
+        logging.error("Response generation error: %s", e)
+        await update.message.reply_text("⚠️ ምላሽ ለመፍጠር አልተሳካም። እባክዎ ቆይተው ይሞክሩ።")
 
 # ===== HANDLE TEXT =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     prompt = update.message.text
+    
+    if not prompt.strip():
+        await update.message.reply_text("⚠️ እባክዎ ትክክለኛ ጽሑፍ ያስገቡ።")
+        return
+        
     await generate_response(prompt, update)
 
-# ===== HANDLE PHOTO =====
+# ===== SIMPLIFIED PHOTO HANDLER =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     try:
+        await update.message.reply_text("📸 ፎቶውን እየተከለለ ነው... እባክዎ ይጠብቁ።")
+        
         photo = update.message.photo[-1]
         file = await photo.get_file()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
             await file.download_to_drive(custom_path=tmp.name)
-            img = Image.open(tmp.name)
-            text = pytesseract.image_to_string(img).strip()
-            if not text:
-                await update.message.reply_text("⚠️ ጽሑፍ ማንበብ አልቻልኩም። እባክዎ ጥያቄዎን ይተይቡ።")
-                return
-            update.message.text = text
-            await generate_response(text, update)
-        os.remove(tmp.name)
+            
+            try:
+                img = Image.open(tmp.name)
+                # Simple OCR attempt
+                text = pytesseract.image_to_string(img).strip()
+                
+                if not text or len(text) < 5:
+                    await update.message.reply_text("⚠️ በፎቶው ውስጥ ሊነበብ የሚችል ጽሑፍ አላገኘንም። እባክዎ ጽሑፉን ይተይቡ።")
+                    return
+                    
+                await update.message.reply_text(f"📖 የተነበበ ጽሑፍ: {text[:100]}...")
+                await generate_response(text, update)
+                
+            except Exception as ocr_error:
+                logging.error("OCR error: %s", ocr_error)
+                await update.message.reply_text("⚠️ የፎቶ ማንበብ አልተሳካም። እባክዎ ጽሑፉን ይተይቡ።")
+            finally:
+                # Cleanup
+                if os.path.exists(tmp.name):
+                    os.remove(tmp.name)
+                    
     except Exception as e:
         logging.error("Photo handler error: %s", e)
-        await update.message.reply_text("⚠️ የምስስ ማቀናበር አልተሳካም።")
+        await update.message.reply_text("⚠️ የፎቶ ማቀናበር አልተሳካም። እባክዎ ጽሑፉን ይተይቡ።")
 
-# ===== HANDLE VOICE =====
+# ===== SIMPLIFIED VOICE HANDLER =====
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     try:
+        await update.message.reply_text("🎤 ድምጽ እየተከለለ ነው... እባክዎ ይጠብቁ።")
+        
         voice = update.message.voice
         file = await voice.get_file()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_ogg:
             await file.download_to_drive(custom_path=tmp_ogg.name)
-            tmp_wav_path = tmp_ogg.name.replace(".ogg", ".wav")
-            AudioSegment.from_ogg(tmp_ogg.name).export(tmp_wav_path, format="wav")
             
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(tmp_wav_path) as source:
-                audio = recognizer.record(source)
-                text = recognizer.recognize_google(audio)
-            
-            update.message.text = text
-            await generate_response(text, update)
-        
-        os.remove(tmp_ogg.name)
-        os.remove(tmp_wav_path)
+            try:
+                # Convert to WAV
+                tmp_wav_path = tmp_ogg.name.replace(".ogg", ".wav")
+                audio = AudioSegment.from_ogg(tmp_ogg.name)
+                audio.export(tmp_wav_path, format="wav")
+                
+                # Speech recognition
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(tmp_wav_path) as source:
+                    audio_data = recognizer.record(source)
+                    text = recognizer.recognize_google(audio_data)
+                
+                await update.message.reply_text(f"🎯 የተቀዳ ጽሑፍ: {text}")
+                await generate_response(text, update)
+                
+            except sr.UnknownValueError:
+                await update.message.reply_text("⚠️ ድምጽዎን ማወቅ አልቻልኩም። እባክዎ እንደገና ይሞክሩ።")
+            except Exception as speech_error:
+                logging.error("Speech recognition error: %s", speech_error)
+                await update.message.reply_text("⚠️ ድምጽ ማወቅ አልተሳካም። እባክዎ ጽሑፉን ይተይቡ።")
+            finally:
+                # Cleanup
+                if os.path.exists(tmp_ogg.name):
+                    os.remove(tmp_ogg.name)
+                if os.path.exists(tmp_wav_path):
+                    os.remove(tmp_wav_path)
+                    
     except Exception as e:
         logging.error("Voice handler error: %s", e)
-        await update.message.reply_text("⚠️ ድምጽ ማወቅ አልተሳካም።")
+        await update.message.reply_text("⚠️ ድምጽ ማቀናበር አልተሳካም። እባክዎ ጽሑፉን ይተይቡ።")
 
 # ===== BUTTON HANDLER =====
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -276,29 +321,31 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats_text)
 
 # ===== SETUP BOT =====
-app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-# Add handlers
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("allusers", all_users))
-app.add_handler(CommandHandler("broadcast", broadcast))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-app.add_handler(CallbackQueryHandler(handle_button))
-
-# Error handler
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.error(f"Exception while handling an update: {context.error}")
-    
-app.add_error_handler(error_handler)
-
-print("🚀 MiniBot is live...")
-
-if __name__ == "__main__":
+def main():
     # Create users file if it doesn't exist
     if not os.path.exists(USER_DB_FILE):
         save_users(set())
     
-    asyncio.run(app.run_polling())
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("allusers", all_users))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(CallbackQueryHandler(handle_button))
+
+    # Error handler
+    async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logging.error(f"Exception while handling an update: {context.error}")
+    
+    app.add_error_handler(error_handler)
+
+    print("🚀 MiniBot is live...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
