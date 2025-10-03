@@ -12,6 +12,8 @@ from telegram.ext import (
 from PIL import Image
 import pytesseract
 from googletrans import Translator
+import speech_recognition as sr
+from pydub import AudioSegment
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -96,7 +98,7 @@ def get_ai_reply(prompt):
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን ይጻፉ። (Default reply is in Amharic, you can switch to English)")
+    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን ይጻፉ ወይም ድምፅ ይላኩ።")
 
 # ===== TEXT HANDLER =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,6 +148,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error("Photo handler error: %s", e)
         await update.message.reply_text(f"⚠️ Image processing failed: {str(e)}")
 
+# ===== VOICE HANDLER =====
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    try:
+        voice = await update.message.voice.get_file()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
+            await voice.download_to_drive(custom_path=tmp.name)
+            ogg_path = tmp.name
+            wav_path = ogg_path.replace(".ogg", ".wav")
+
+        # Convert OGG to WAV
+        AudioSegment.from_file(ogg_path).export(wav_path, format="wav")
+        os.remove(ogg_path)
+
+        # Recognize speech
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data, language="am-ET")
+
+        os.remove(wav_path)
+
+        if not text:
+            await update.message.reply_text("⚠️ No speech detected. Try again.")
+            return
+
+        await update.message.chat.send_action(action=ChatAction.TYPING)
+        reply_en, reply_am = await asyncio.to_thread(get_ai_reply, text)
+
+        sent_msg = await update.message.reply_text(reply_am)
+        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+
+        keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
+        await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    except Exception as e:
+        logging.error("Voice handler error: %s", e)
+        await update.message.reply_text(f"⚠️ Voice processing failed: {str(e)}")
+
 # ===== BUTTON HANDLER =====
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -179,9 +221,10 @@ app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 app.add_handler(CallbackQueryHandler(handle_button))
 
-print("🚀 EduBot with Google Translate is live...")
+print("🚀 EduBot with Voice, OCR, and Translate is live...")
 
 if __name__ == "__main__":
     asyncio.run(app.run_polling())
