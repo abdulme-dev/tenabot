@@ -3,3 +3,5 @@ Pillow==10.0.0
 pytesseract==0.3.10
 requests==2.31.0
 googletrans==4.0.0-rc1
+SpeechRecognition==3.9.0
+pydub==0.25.1
