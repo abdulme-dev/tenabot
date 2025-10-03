@@ -65,7 +65,7 @@ def get_ai_reply(prompt):
         }
 
         data = {
-            "model": "deepseek/deepseek-r1:free",
+            "model": "deepseek/deepseek-chat-v3.1:free",
             "messages": [
                 {"role": "system", "content": "You are a helpful tutor for Ethiopian students. Always explain clearly."},
                 {"role": "user", "content": prompt},
