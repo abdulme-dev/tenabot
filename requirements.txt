@@ -1,7 +1,7 @@
-python-telegram-bot
-deep-translator
+python-telegram-bot==20.7
 requests
-python-dotenv
-pillow 
+pillow
 pytesseract
-img2pdf
+googletrans==4.0.0-rc1
+SpeechRecognition
+pydub
