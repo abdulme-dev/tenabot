@@ -14,6 +14,7 @@ import pytesseract
 from googletrans import Translator
 import speech_recognition as sr
 from pydub import AudioSegment
+from gtts import gTTS
 
 # ===== ENV VARIABLES =====
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -98,7 +99,33 @@ def get_ai_reply(prompt):
 # ===== START HANDLER =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን ይጻፉ ወይም ድምፅ ይላኩ።")
+    await update.message.reply_text("👋 እንኳን ደህና መጡ! ጥያቄዎን ይጻፉ፣ ፎቶ ይላኩ ወይም ድምፅ ይናገሩ።")
+
+# ===== AI RESPONSE SENDER (Text + Voice) =====
+async def send_ai_response(update, reply_en, reply_am):
+    sent_msg = await update.message.reply_text(reply_am)
+
+    # Save for translation toggle
+    translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
+
+    # Send Amharic voice reply
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_mp3:
+            tts = gTTS(reply_am, lang="am")
+            tts.save(tmp_mp3.name)
+
+            ogg_path = tmp_mp3.name.replace(".mp3", ".ogg")
+            AudioSegment.from_file(tmp_mp3.name).export(ogg_path, format="ogg")
+
+            await update.message.reply_voice(voice=open(ogg_path, "rb"))
+            os.remove(tmp_mp3.name)
+            os.remove(ogg_path)
+    except Exception as e:
+        logging.error("TTS Error: %s", e)
+
+    # Add button
+    keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
+    await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===== TEXT HANDLER =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -107,16 +134,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action=ChatAction.TYPING)
 
     reply_en, reply_am = await asyncio.to_thread(get_ai_reply, prompt)
-    sent_msg = await update.message.reply_text(reply_am)
-
-    translation_cache[str(sent_msg.message_id)] = {
-        "am": reply_am,
-        "en": reply_en,
-        "current": "am"
-    }
-
-    keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
-    await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await send_ai_response(update, reply_en, reply_am)
 
 # ===== PHOTO HANDLER =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -132,21 +150,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(tmp.name)
 
         if not text:
-            await update.message.reply_text("⚠️ No text detected in image. Try again.")
+            await update.message.reply_text("⚠️ በፎቶው ውስጥ ጽሑፍ አልተገኘም።")
             return
 
         await update.message.chat.send_action(action=ChatAction.TYPING)
         reply_en, reply_am = await asyncio.to_thread(get_ai_reply, text)
-
-        sent_msg = await update.message.reply_text(reply_am)
-        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
-
-        keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
-        await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_ai_response(update, reply_en, reply_am)
 
     except Exception as e:
         logging.error("Photo handler error: %s", e)
-        await update.message.reply_text(f"⚠️ Image processing failed: {str(e)}")
+        await update.message.reply_text(f"⚠️ ፎቶ አልተሰራም። {str(e)}")
 
 # ===== VOICE HANDLER =====
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,7 +176,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AudioSegment.from_file(ogg_path).export(wav_path, format="wav")
         os.remove(ogg_path)
 
-        # Recognize speech
+        # Recognize speech (Amharic)
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
@@ -172,21 +185,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(wav_path)
 
         if not text:
-            await update.message.reply_text("⚠️ No speech detected. Try again.")
+            await update.message.reply_text("⚠️ ድምፅ አልተሰማም።")
             return
 
         await update.message.chat.send_action(action=ChatAction.TYPING)
         reply_en, reply_am = await asyncio.to_thread(get_ai_reply, text)
-
-        sent_msg = await update.message.reply_text(reply_am)
-        translation_cache[str(sent_msg.message_id)] = {"am": reply_am, "en": reply_en, "current": "am"}
-
-        keyboard = [[InlineKeyboardButton("🌐 Translate", callback_data=f"translate|{sent_msg.message_id}")]]
-        await update.message.reply_text("Options:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_ai_response(update, reply_en, reply_am)
 
     except Exception as e:
         logging.error("Voice handler error: %s", e)
-        await update.message.reply_text(f"⚠️ Voice processing failed: {str(e)}")
+        await update.message.reply_text(f"⚠️ ድምፅ አልተሰራም። {str(e)}")
 
 # ===== BUTTON HANDLER =====
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,7 +208,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg_id = data
             data = translation_cache.get(msg_id)
             if not data:
-                await query.message.reply_text("⚠️ Message not found.")
+                await query.message.reply_text("⚠️ መልእክት አልተገኘም።")
                 return
 
             if data["current"] == "am":
@@ -224,7 +232,7 @@ app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 app.add_handler(CallbackQueryHandler(handle_button))
 
-print("🚀 EduBot with Voice, OCR, and Translate is live...")
+print("🚀 EduBot (Text + OCR + Voice + TTS) is live...")
 
 if __name__ == "__main__":
     asyncio.run(app.run_polling())
